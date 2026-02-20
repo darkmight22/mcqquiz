@@ -1,10 +1,11 @@
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
 import sqlite3
 import os
 import random
-import smtplib
+import copy
 from datetime import datetime, timedelta
 from data_loader import (
     LANGUAGES,
@@ -17,23 +18,17 @@ from data_loader import (
     get_challenges_by_language_and_level,
     get_challenge,
     get_language_label,
+    get_randomized_quiz,
+    get_randomized_quiz_by_id,
+    shuffle_options,
 )
-app = Flask(__name__)
-app.secret_key = 'your-secret-key-change-in-production'  # Change this in production!
-app.config['DATABASE'] = 'codemcq.db'
 
-EMAIL_USER = 'darkmight2242@gmail.com'
-EMAIL_PASSWORD = 'jfkn dgus pigr ltcp '  # Use Gmail App Password or similar
-OTP_EXPIRY_MINUTES = 5
-# In production consider moving these limits into config and pairing with
-# per-IP throttling to prevent OTP brute force attacks.
-MAX_OTP_ATTEMPTS = 3
-DISPOSABLE_DOMAINS = [
-    "mailinator.com",
-    "10minutemail.com",
-    "guerrillamail.com",
-    "tempmail.com",
-]
+# Load environment variables from .env file
+load_dotenv()
+
+app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-change-in-production')
+app.config['DATABASE'] = os.getenv('DATABASE', 'codemcq.db')
 
 
 @app.context_processor
@@ -55,24 +50,8 @@ def init_db():
         name TEXT NOT NULL,
         email TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        email_verified INTEGER DEFAULT 0,
-        otp_code TEXT,
-        otp_expires_at TIMESTAMP,
-        otp_attempts INTEGER DEFAULT 0
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
-    
-    # Ensure legacy databases get the new columns when missing
-    c.execute('PRAGMA table_info(users)')
-    existing_columns = {row[1] for row in c.fetchall()}
-    if 'email_verified' not in existing_columns:
-        c.execute('ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0')
-    if 'otp_code' not in existing_columns:
-        c.execute('ALTER TABLE users ADD COLUMN otp_code TEXT')
-    if 'otp_expires_at' not in existing_columns:
-        c.execute('ALTER TABLE users ADD COLUMN otp_expires_at TIMESTAMP')
-    if 'otp_attempts' not in existing_columns:
-        c.execute('ALTER TABLE users ADD COLUMN otp_attempts INTEGER DEFAULT 0')
     
     # Attempts table
     c.execute('''CREATE TABLE IF NOT EXISTS attempts (
@@ -119,76 +98,11 @@ def get_db():
     return conn
 
 
-def generate_otp():
-    """Return a 6-digit OTP"""
-    return f"{random.randint(100000, 999999)}"
-
-
-def send_otp_email(to_email, otp):
-    """Send the OTP email via Gmail SMTP"""
-    subject = "CodeMCQ Arena Email Verification OTP"
-    body = (
-        f"Your OTP for verifying CodeMCQ Arena is {otp}.\n\n"
-        f"This code expires in {OTP_EXPIRY_MINUTES} minutes.\n"
-        "If you did not request this, please ignore the email.\n"
-        "Only 3 attempts are provided.\n"
-        "After 3 attempts are over please wait for 5 minutes to resend OTP.\n\n"
-    )
-    # Include From header and basic MIME to improve deliverability
-    message = f"From: CodeMCQ Arena <{EMAIL_USER}>\nSubject: {subject}\n\n{body}"
-
-    try:
-        # Use SMTP_SSL which is compatible with Gmail's 465 port
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_USER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_USER, to_email, message)
-    except Exception as exc:
-        # Log the exception with helpful hints for debugging
-        app.logger.exception(
-            "Failed to send OTP email to %s: %s.\nHints: ensure EMAIL_USER and EMAIL_PASSWORD are correct, "
-            "that Gmail account allows SMTP access (use an app password for accounts with 2FA), "
-            "and that network outbound SMTP is allowed.",
-            to_email,
-            exc,
-        )
-        raise
-
-
-def is_disposable_email(email):
-    """Check if email domain is in the disposable list"""
-    if '@' not in email:
-        return False
-    domain = email.split('@')[-1].lower()
-    return domain in DISPOSABLE_DOMAINS
-
-
 def set_user_session(user):
     """Log the user into the current session."""
     session['user_id'] = user['id']
     session['user_name'] = user['name']
     session['user_email'] = user['email']
-    session['is_verified'] = bool(user['email_verified'])
-
-
-def set_pending_verification(email, user_id):
-    """Persist pending verification info in session for convenience."""
-    session['pending_verification_email'] = email
-    session['pending_user_id'] = user_id
-
-
-def refresh_otp_for_user(user_id):
-    """Generate and store a new OTP for the given user."""
-    otp = generate_otp()
-    expires_at = datetime.utcnow() + timedelta(minutes=OTP_EXPIRY_MINUTES)
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        'UPDATE users SET otp_code = ?, otp_expires_at = ?, otp_attempts = 0 WHERE id = ?',
-        (otp, expires_at.isoformat(), user_id)
-    )
-    conn.commit()
-    conn.close()
-    return otp
 
 
 def parse_db_timestamp(value):
@@ -218,22 +132,6 @@ def require_login(f):
         if 'user_id' not in session:
             flash('Please login to access this page.', 'error')
             return redirect(url_for('login'))
-        
-        if not session.get('is_verified'):
-            # Double-check with DB in case session is stale
-            conn = get_db()
-            c = conn.cursor()
-            c.execute('SELECT email_verified, email FROM users WHERE id = ?', (session['user_id'],))
-            user = c.fetchone()
-            conn.close()
-            if user and user['email_verified']:
-                session['is_verified'] = True
-            else:
-                pending_email = user['email'] if user else session.get('user_email')
-                if pending_email:
-                    set_pending_verification(pending_email, session.get('user_id'))
-                flash('Please verify your email before accessing this area.', 'error')
-                return redirect(url_for('verify_email'))
         return f(*args, **kwargs)
     decorated_function.__name__ = f.__name__
     return decorated_function
@@ -265,10 +163,6 @@ def signup():
             flash('Password must be at least 8 or long characters long.', 'error')
             return render_template('signup.html', name=name, email=email)
         
-        if is_disposable_email(email):
-            flash('Disposable / temporary email addresses are not allowed. Please use a real email.', 'error')
-            return render_template('signup.html', name=name, email=email)
-        
         conn = get_db()
         c = conn.cursor()
         
@@ -279,30 +173,24 @@ def signup():
             flash('Email already registered. Please login.', 'error')
             return render_template('signup.html', name=name, email=email)
         
-        # Create new user
+        # Create new user with email automatically verified
         password_hash = generate_password_hash(password)
         c.execute('INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)',
                   (name, email, password_hash))
         user_id = c.lastrowid
-        
-        otp = generate_otp()
-        expires_at = datetime.utcnow() + timedelta(minutes=OTP_EXPIRY_MINUTES)
-        c.execute(
-            'UPDATE users SET otp_code = ?, otp_expires_at = ?, otp_attempts = 0 WHERE id = ?',
-            (otp, expires_at.isoformat(), user_id)
-        )
         conn.commit()
         conn.close()
         
-        set_pending_verification(email, user_id)
+        # Fetch the newly created user and log them in
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT id, name, email FROM users WHERE id = ?', (user_id,))
+        user = c.fetchone()
+        conn.close()
         
-        try:
-            send_otp_email(email, otp)
-            flash('Account created! Enter the OTP we sent to verify your email.', 'success')
-        except Exception:
-            flash('Account created but we could not send the OTP email. Please click "Resend OTP" after verifying your email settings.', 'error')
-        
-        return redirect(url_for('verify_email'))
+        set_user_session(user)
+        flash('Account created successfully! You are now logged in.', 'success')
+        return redirect(url_for('dashboard'))
     
     return render_template('signup.html')
 
@@ -322,16 +210,11 @@ def login():
         
         conn = get_db()
         c = conn.cursor()
-        c.execute('SELECT id, name, email, password_hash, email_verified FROM users WHERE email = ?', (email,))
+        c.execute('SELECT id, name, email, password_hash FROM users WHERE email = ?', (email,))
         user = c.fetchone()
         conn.close()
         
         if user and check_password_hash(user['password_hash'], password):
-            if not user['email_verified']:
-                set_pending_verification(user['email'], user['id'])
-                flash('Please verify your email using the OTP sent to you before logging in.', 'error')
-                return redirect(url_for('verify_email'))
-            
             set_user_session(user)
             flash('Login successful!', 'success')
             return redirect(url_for('dashboard'))
@@ -341,133 +224,6 @@ def login():
     
     return render_template('login.html')
 
-
-@app.route('/verify-email', methods=['GET', 'POST'])
-def verify_email():
-    """Verify user email using OTP"""
-    if session.get('user_id') and session.get('is_verified'):
-        flash('Your email is already verified.', 'info')
-        return redirect(url_for('dashboard'))
-    
-    query_email = (request.args.get('email') or '').strip()
-    if query_email:
-        session['pending_verification_email'] = query_email
-    email = query_email or session.get('pending_verification_email', '')
-    
-    if request.method == 'POST':
-        email = (request.form.get('email') or email or '').strip()
-        otp = request.form.get('otp', '').strip()
-        
-        if not email or not otp:
-            flash('Email and OTP are required.', 'error')
-            return render_template('verify_email.html', email=email, otp_expiry_minutes=OTP_EXPIRY_MINUTES)
-        
-        conn = get_db()
-        c = conn.cursor()
-        c.execute('''
-            SELECT id, name, email, email_verified, otp_code, otp_expires_at, otp_attempts
-            FROM users
-            WHERE email = ?
-        ''', (email,))
-        user = c.fetchone()
-        
-        if not user:
-            conn.close()
-            flash('Account not found for the provided email.', 'error')
-            return render_template('verify_email.html', email=email, otp_expiry_minutes=OTP_EXPIRY_MINUTES)
-        
-        if user['email_verified']:
-            conn.close()
-            set_user_session(user)
-            flash('Email already verified. You are logged in!', 'success')
-            return redirect(url_for('dashboard'))
-        
-        expires_at = parse_db_timestamp(user['otp_expires_at'])
-        if not user['otp_code']:
-            conn.close()
-            flash('No OTP found. Please resend the OTP.', 'error')
-            set_pending_verification(email, user['id'])
-            return render_template('verify_email.html', email=email, otp_expiry_minutes=OTP_EXPIRY_MINUTES)
-        
-        if not expires_at or datetime.utcnow() > expires_at:
-            conn.close()
-            flash('OTP expired. Please resend a new OTP.', 'error')
-            set_pending_verification(email, user['id'])
-            return render_template('verify_email.html', email=email, otp_expiry_minutes=OTP_EXPIRY_MINUTES)
-        
-        if otp != user['otp_code']:
-            attempts = (user['otp_attempts'] or 0) + 1
-            c.execute('UPDATE users SET otp_attempts = ? WHERE id = ?', (attempts, user['id']))
-            conn.commit()
-            conn.close()
-            if attempts >= MAX_OTP_ATTEMPTS:
-                flash('Too many incorrect attempts. Please resend OTP.', 'error')
-            else:
-                flash('Invalid OTP. Please try again.', 'error')
-            set_pending_verification(email, user['id'])
-            return render_template('verify_email.html', email=email, otp_expiry_minutes=OTP_EXPIRY_MINUTES)
-        
-        c.execute('''
-            UPDATE users
-            SET email_verified = 1,
-                otp_code = NULL,
-                otp_expires_at = NULL,
-                otp_attempts = 0
-            WHERE id = ?
-        ''', (user['id'],))
-        conn.commit()
-        conn.close()
-        
-        user_data = dict(user)
-        user_data['email_verified'] = 1
-        set_user_session(user_data)
-        session.pop('pending_verification_email', None)
-        session.pop('pending_user_id', None)
-        
-        flash('Email verified! Welcome to CodeMCQ Arena.', 'success')
-        return redirect(url_for('dashboard'))
-    
-    if not email:
-        flash('No email to verify. Please sign up or log in.', 'error')
-        return redirect(url_for('signup'))
-    
-    return render_template('verify_email.html', email=email, otp_expiry_minutes=OTP_EXPIRY_MINUTES)
-
-
-@app.route('/resend-otp', methods=['POST'])
-def resend_otp():
-    """Regenerate and send a new OTP to the user's email"""
-    # Consider adding per-user/IP cooldowns before allowing another resend.
-    session_email = session.get('pending_verification_email') or ''
-    email = request.form.get('email', '').strip() or session_email.strip()
-    
-    if not email:
-        flash('Provide an email to resend the OTP.', 'error')
-        return redirect(url_for('signup'))
-    
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('SELECT id, email_verified FROM users WHERE email = ?', (email,))
-    user = c.fetchone()
-    conn.close()
-    
-    if not user:
-        flash('Account not found. Please sign up.', 'error')
-        return redirect(url_for('signup'))
-    
-    if user['email_verified']:
-        flash('Email already verified. Please log in.', 'info')
-        return redirect(url_for('login'))
-    
-    otp = refresh_otp_for_user(user['id'])
-    try:
-        send_otp_email(email, otp)
-        flash('A new OTP has been sent to your email.', 'success')
-    except Exception:
-        flash('Failed to send OTP. Please try again later.', 'error')
-    
-    set_pending_verification(email, user['id'])
-    return redirect(url_for('verify_email'))
 
 @app.route('/logout')
 def logout():
@@ -568,24 +324,33 @@ def quiz_select():
 @app.route('/quiz/start/<language>/<level>')
 @require_login
 def quiz_start(language, level):
-    """Start a quiz - create attempt and redirect to first question"""
+    """Start a quiz - create attempt with randomized questions"""
     language = language.lower()
     level = level.lower()
     if language not in LANGUAGES or level not in LEVELS:
         flash('Invalid quiz selection.', 'error')
         return redirect(url_for('quiz_select'))
 
-    quiz = load_quiz(language, level)
+    # Load quiz with randomized questions and options
+    quiz = get_randomized_quiz(language, level)
     if not quiz:
-        flash('Quiz not found.', 'error')
+        flash(f'Quiz not found for {language} - {level}. Please check available options.', 'error')
         return redirect(url_for('quiz_select'))
 
-    quiz_id = quiz.get('quiz_id') or f"{language.lower()}_{level.lower()}"
+    # Use quiz_id from loaded quiz (e.g., 'js_easy' from JSON)
+    quiz_id = quiz.get('quiz_id')
+    if not quiz_id:
+        flash('Invalid quiz configuration.', 'error')
+        return redirect(url_for('quiz_select'))
     
     conn = get_db()
     c = conn.cursor()
     
-    # Create new attempt
+    # Create new attempt with randomized questions
+    # Store the randomized quiz in session for the duration of this attempt
+    session[f'quiz_attempt_questions_{quiz_id}'] = quiz.get('questions', [])
+    
+    # Create new attempt record
     c.execute('''
         INSERT INTO attempts (user_id, quiz_id, started_at)
         VALUES (?, ?, ?)
@@ -599,7 +364,7 @@ def quiz_start(language, level):
 @app.route('/quiz/question/<int:attempt_id>/<int:q_no>', methods=['GET', 'POST'])
 @require_login
 def quiz_question(attempt_id, q_no):
-    """Display and handle quiz question"""
+    """Display and handle quiz question with randomized options"""
     conn = get_db()
     c = conn.cursor()
     
@@ -611,21 +376,37 @@ def quiz_question(attempt_id, q_no):
         flash('Attempt not found.', 'error')
         return redirect(url_for('quiz_select'))
     
-    quiz = get_quiz_by_id(attempt['quiz_id'])
-    if not quiz:
+    # Get non-randomized quiz for metadata and to fetch questions if needed
+    # Use quiz_id from attempt which could be 'js_easy' or 'javascript_easy'
+    quiz_id = attempt['quiz_id']
+    quiz_orig = get_quiz_by_id(quiz_id)
+    if not quiz_orig:
         conn.close()
-        flash('Quiz not found.', 'error')
+        flash(f'Quiz not found for {quiz_id}.', 'error')
         return redirect(url_for('quiz_select'))
     
-    quiz_identifier = quiz.get('quiz_id') or attempt['quiz_id']
-    questions = quiz.get('questions', [])
+    quiz_identifier = quiz_orig.get('quiz_id') or attempt['quiz_id']
+    
+    # Try to get randomized questions from session
+    session_key = f'quiz_attempt_questions_{attempt["quiz_id"]}'
+    if session_key in session:
+        questions = session[session_key]
+    else:
+        # Fallback: reload and randomize if session was lost
+        quiz_randomized = get_randomized_quiz_by_id(attempt['quiz_id'])
+        if quiz_randomized:
+            questions = quiz_randomized.get('questions', [])
+            session[session_key] = questions
+        else:
+            questions = quiz_orig.get('questions', [])
+    
     total_questions = len(questions)
     
     if q_no < 0 or q_no >= total_questions:
         conn.close()
         return redirect(url_for('quiz_submit', attempt_id=attempt_id))
     
-    question = get_question_by_index(quiz, q_no)
+    question = questions[q_no] if q_no < len(questions) else None
     if not question:
         conn.close()
         return redirect(url_for('quiz_submit', attempt_id=attempt_id))
@@ -683,7 +464,7 @@ def quiz_question(attempt_id, q_no):
     selected_option = saved_answer['selected_option_id'] if saved_answer else None
     
     # Calculate time remaining
-    duration = timedelta(minutes=quiz.get('duration_minutes', 15))
+    duration = timedelta(minutes=quiz_orig.get('duration_minutes', 15))
     started_at = datetime.fromisoformat(attempt['started_at']) if isinstance(attempt['started_at'], str) else attempt['started_at']
     elapsed = datetime.now() - started_at
     remaining = duration - elapsed
@@ -691,8 +472,12 @@ def quiz_question(attempt_id, q_no):
     
     conn.close()
     
+    # Prepare quiz object with randomized questions for template
+    quiz_display = copy.deepcopy(quiz_orig)
+    quiz_display['questions'] = questions
+    
     return render_template('quiz_question.html',
-                         quiz=quiz,
+                         quiz=quiz_display,
                          question=question,
                          q_no=q_no,
                          total_questions=total_questions,
@@ -720,14 +505,21 @@ def quiz_submit(attempt_id):
         conn.close()
         return redirect(url_for('result', attempt_id=attempt_id))
     
-    quiz = get_quiz_by_id(attempt['quiz_id'])
-    if not quiz:
+    # Get randomized questions from session
+    quiz_orig = get_quiz_by_id(attempt['quiz_id'])
+    if not quiz_orig:
         conn.close()
         flash('Quiz not found.', 'error')
         return redirect(url_for('quiz_select'))
     
+    session_key = f'quiz_attempt_questions_{attempt["quiz_id"]}'
+    if session_key in session:
+        questions = session[session_key]
+    else:
+        # Fallback: use original questions
+        questions = quiz_orig.get('questions', [])
+    
     # Calculate score
-    questions = quiz.get('questions', [])
     total_questions = len(questions)
     correct = 0
     wrong = 0
@@ -762,6 +554,9 @@ def quiz_submit(attempt_id):
     conn.commit()
     conn.close()
     
+    # Clean up session data for this attempt
+    session.pop(session_key, None)
+    
     return redirect(url_for('result', attempt_id=attempt_id))
 
 @app.route('/result/<int:attempt_id>')
@@ -785,8 +580,15 @@ def result(attempt_id):
         flash('Quiz not found.', 'error')
         return redirect(url_for('quiz_select'))
     
+    # Try to get randomized questions from session
+    session_key = f'quiz_attempt_questions_{attempt["quiz_id"]}'
+    if session_key in session:
+        questions = session[session_key]
+    else:
+        # Fallback: use original questions (session may have expired)
+        questions = quiz.get('questions', [])
+    
     # Get all answers
-    questions = quiz.get('questions', [])
     results = []
     
     for question in questions:
@@ -797,24 +599,36 @@ def result(attempt_id):
         answer = c.fetchone()
         
         selected_option_id = answer['selected_option_id'] if answer else None
+        selected_option_text = None
         correct_option_id = None
+        correct_option_text = None
+        
+        # Find option text for selected and correct answers
         for opt in question['options']:
+            if opt['id'] == selected_option_id:
+                selected_option_text = opt.get('text', '')
             if opt['is_correct']:
                 correct_option_id = opt['id']
-                break
+                correct_option_text = opt.get('text', '')
         
         results.append({
             'question': question,
             'selected_option_id': selected_option_id,
+            'selected_option_text': selected_option_text,
             'correct_option_id': correct_option_id,
+            'correct_option_text': correct_option_text,
             'is_correct': answer['is_correct'] if answer else False
         })
     
     conn.close()
     
+    # Prepare quiz object with randomized questions
+    quiz_display = copy.deepcopy(quiz)
+    quiz_display['questions'] = questions
+    
     return render_template('result.html',
                          attempt=dict(attempt),
-                         quiz=quiz,
+                         quiz=quiz_display,
                          results=results)
 
 @app.route('/coding/list')
@@ -882,6 +696,5 @@ def coding_submit():
 
 if __name__ == '__main__':
     init_db()
-    app.run()
-
+    app.run(debug=True, host='0.0.0.0', port=5011)
 

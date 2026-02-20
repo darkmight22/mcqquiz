@@ -5,6 +5,8 @@ Handles loading quizzes and coding challenges from JSON files.
 
 import json
 import os
+import random
+import copy
 from functools import lru_cache
 from typing import Dict, List, Optional
 
@@ -81,11 +83,46 @@ def load_quiz(language: str, level: str) -> Optional[Dict]:
 
 
 def get_quiz_by_id(quiz_id: str) -> Optional[Dict]:
-    """Load quiz data using combined quiz_id format <language>_<level>."""
+    """Load quiz data using combined quiz_id format <language>_<level> or shorthand like js_easy.
+    Handles both 'javascript_easy' and 'js_easy' formats.
+    """
     if not quiz_id or '_' not in quiz_id:
         return None
+    
+    # Split by last underscore to get language and level
     language, level = quiz_id.rsplit('_', 1)
-    return load_quiz(language, level)
+    language = normalise(language)
+    level = normalise(level)
+    
+    # Try to load with the provided language name first
+    quiz = load_quiz(language, level)
+    if quiz:
+        return quiz
+    
+    # If not found and language is short (like 'js'), expand it
+    # by finding the full language name that contains this as a prefix or matches it
+    expanded_languages = {
+        'js': 'javascript',
+        'py': 'python',
+        'cpp': 'cpp',
+        'cs': 'csharp',
+        'c#': 'csharp',
+    }
+    
+    if language in expanded_languages:
+        full_language = expanded_languages[language]
+        quiz = load_quiz(full_language, level)
+        if quiz:
+            return quiz
+    
+    # Try fuzzy matching with full language list
+    for full_lang in LANGUAGES:
+        if full_lang.startswith(language) or language.startswith(full_lang[:2]):
+            quiz = load_quiz(full_lang, level)
+            if quiz:
+                return quiz
+    
+    return None
 
 
 def get_question_by_index(quiz_data: Dict, index: int) -> Optional[Dict]:
@@ -151,6 +188,64 @@ def get_challenge(challenge_id: str) -> Optional[Dict]:
         if challenge.get('id') == challenge_id:
             return challenge
     return None
+
+
+def shuffle_options(question: Dict) -> Dict:
+    """
+    Create a copy of a question with shuffled options.
+    Maintains correct answer mapping after shuffling.
+    Does NOT modify the original question.
+    """
+    question_copy = copy.deepcopy(question)
+    options = question_copy.get('options', [])
+    
+    if options:
+        # Create a copy of options list and shuffle it
+        options_copy = copy.deepcopy(options)
+        random.shuffle(options_copy)
+        question_copy['options'] = options_copy
+    
+    return question_copy
+
+
+def shuffle_quiz_questions(quiz: Dict) -> Dict:
+    """
+    Create a copy of a quiz with shuffled questions and shuffled options.
+    Maintains question and answer integrity.
+    Does NOT modify the original quiz.
+    """
+    quiz_copy = copy.deepcopy(quiz)
+    questions = quiz_copy.get('questions', [])
+    
+    if questions:
+        # Shuffle questions
+        shuffled_questions = copy.deepcopy(questions)
+        random.shuffle(shuffled_questions)
+        
+        # Also shuffle options within each question
+        shuffled_questions = [shuffle_options(q) for q in shuffled_questions]
+        quiz_copy['questions'] = shuffled_questions
+    
+    return quiz_copy
+
+
+def get_randomized_quiz(language: str, level: str) -> Optional[Dict]:
+    """
+    Load a quiz and return it with randomized questions and options.
+    Each call returns a new randomized version.
+    """
+    quiz = load_quiz(language, level)
+    if quiz:
+        return shuffle_quiz_questions(quiz)
+    return None
+
+
+def get_randomized_quiz_by_id(quiz_id: str) -> Optional[Dict]:
+    """Load quiz data using combined quiz_id format and return randomized version."""
+    if not quiz_id or '_' not in quiz_id:
+        return None
+    language, level = quiz_id.rsplit('_', 1)
+    return get_randomized_quiz(language, level)
 
 
 # Backwards-compatible helper names (if templates/legacy code expect them)

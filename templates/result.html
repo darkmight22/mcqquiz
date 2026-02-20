@@ -65,8 +65,8 @@
                     <div class="answer-item">
                         <span class="answer-label">Your Answer:</span>
                         <span class="answer-value {% if result.selected_option_id == result.correct_option_id %}correct{% else %}wrong{% endif %}">
-                            {% if result.selected_option_id %}
-                                {{ result.selected_option_id|upper }}
+                            {% if result.selected_option_text %}
+                                <strong>{{ result.selected_option_id|upper }}.</strong> {{ result.selected_option_text }}
                             {% else %}
                                 Not answered
                             {% endif %}
@@ -74,7 +74,7 @@
                     </div>
                     <div class="answer-item">
                         <span class="answer-label">Correct Answer:</span>
-                        <span class="answer-value correct">{{ result.correct_option_id|upper }}</span>
+                        <span class="answer-value correct"><strong>{{ result.correct_option_id|upper }}.</strong> {{ result.correct_option_text }}</span>
                     </div>
                 </div>
             </div>
@@ -92,8 +92,8 @@
 {% block extra_js %}
 <script>
     // Animate score percentage
-    const totalQuestions = {{ quiz.questions|length }};
-    const score = {{ attempt.score }};
+    const totalQuestions = { quiz.questions|length };
+    const score = { attempt.score };
     const percentage = Math.round((score / totalQuestions) * 100);
     
     const percentageElement = document.getElementById('score-percentage');

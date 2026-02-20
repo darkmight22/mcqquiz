@@ -1,8 +1,3 @@
-/**
- * CodeMCQ Arena - Main JavaScript
- * Handles animations, interactions, and UI enhancements
- */
-
 // Wait for DOM to load
 document.addEventListener('DOMContentLoaded', function() {
     initAnimations();
@@ -20,12 +15,12 @@ function initAnimations() {
     const cards = document.querySelectorAll('.glass-card');
     cards.forEach((card, index) => {
         card.style.opacity = '0';
-        card.style.transform = 'translateY(20px)';
+        card.style.transform = 'translateY(15px)';
         
         setTimeout(() => {
-            card.style.transition = 'all 0.5s ease';
-            card.style.opacity = '1';
-            card.style.transform = 'translateY(0)';
+            card.style.transition = 'all 0.8s ease';
+            card.style.opacity = '2';
+            card.style.transform = 'translateY(10px))';
         }, index * 100);
     });
     
@@ -33,11 +28,11 @@ function initAnimations() {
     const buttons = document.querySelectorAll('.btn');
     buttons.forEach(button => {
         button.addEventListener('mouseenter', function() {
-            this.style.transition = 'all 0.3s ease';
+            this.style.transition = 'all 0.7s ease';
         });
         
         button.addEventListener('mouseleave', function() {
-            this.style.transition = 'all 0.3s ease';
+            this.style.transition = 'all 0.7s ease';
         });
     });
 }
@@ -441,4 +436,31 @@ function initQuizSelector() {
     updateUI();
 }
 
+/**
+ * Fisher-Yates Shuffle Algorithm
+ * Randomizes an array in-place efficiently
+ * @param {Array} array - The array to shuffle
+ * @returns {Array} - The shuffled array (same reference)
+ */
+function fisherYatesShuffle(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        // Swap elements at positions i and j
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+}
 
+/**
+ * Create a shallow copy of an array and shuffle it
+ * Does NOT modify the original array
+ * @param {Array} array - The array to shuffle
+ * @returns {Array} - A new shuffled array
+ */
+function getShuffledCopy(array) {
+    if (!Array.isArray(array)) {
+        return array;
+    }
+    const copy = [...array];
+    return fisherYatesShuffle(copy);
+}
